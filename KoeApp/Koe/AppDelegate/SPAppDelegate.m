@@ -168,12 +168,28 @@ static BOOL SPLabFlag(const char *name) {
     }
 }
 
-- (void)applyHotkeyConfig:(struct SPHotkeyConfig)hotkeyConfig restartMonitorIfNeeded:(BOOL)restartIfNeeded {
+- (NSArray<SPHotkeyTrigger *> *)extraHotkeyTriggersFromCore {
+    struct SPHotkeyTriggerParams raw[8];
+    uint32_t count = sp_core_get_extra_hotkey_triggers(raw, 8);
+    NSMutableArray<SPHotkeyTrigger *> *triggers = [NSMutableArray arrayWithCapacity:count];
+    for (uint32_t i = 0; i < count && i < 8; i++) {
+        [triggers addObject:[[SPHotkeyTrigger alloc] initWithKeyCode:raw[i].key_code
+                                                          altKeyCode:raw[i].alt_key_code
+                                                        modifierFlag:(NSUInteger)raw[i].modifier_flag
+                                                           matchKind:raw[i].match_kind]];
+    }
+    return triggers;
+}
+
+- (void)applyHotkeyConfig:(struct SPHotkeyConfig)hotkeyConfig
+            extraTriggers:(NSArray<SPHotkeyTrigger *> *)extraTriggers
+   restartMonitorIfNeeded:(BOOL)restartIfNeeded {
     BOOL changed = self.hotkeyMonitor.targetKeyCode != hotkeyConfig.trigger_key_code ||
                    self.hotkeyMonitor.altKeyCode != hotkeyConfig.trigger_alt_key_code ||
                    self.hotkeyMonitor.targetModifierFlag != hotkeyConfig.trigger_modifier_flag ||
                    self.hotkeyMonitor.targetMatchKind != hotkeyConfig.trigger_match_kind ||
-                   self.hotkeyMonitor.triggerMode != (SPHotkeyTriggerMode)hotkeyConfig.trigger_mode;
+                   self.hotkeyMonitor.triggerMode != (SPHotkeyTriggerMode)hotkeyConfig.trigger_mode ||
+                   ![self.hotkeyMonitor.extraTriggers isEqualToArray:extraTriggers];
 
     if (!changed) return;
 
@@ -186,6 +202,7 @@ static BOOL SPLabFlag(const char *name) {
     self.hotkeyMonitor.targetModifierFlag = hotkeyConfig.trigger_modifier_flag;
     self.hotkeyMonitor.targetMatchKind = hotkeyConfig.trigger_match_kind;
     self.hotkeyMonitor.triggerMode = (SPHotkeyTriggerMode)hotkeyConfig.trigger_mode;
+    self.hotkeyMonitor.extraTriggers = extraTriggers;
 
     if (restartIfNeeded) {
         [self.hotkeyMonitor start];
@@ -196,13 +213,15 @@ static BOOL SPLabFlag(const char *name) {
     [self.rustBridge reloadConfig];
 
     struct SPHotkeyConfig newConfig = sp_core_get_hotkey_config();
-    NSLog(@"[Koe] Reloaded hotkey config: trigger=%d/%d flag=0x%llx kind=%d",
+    NSArray<SPHotkeyTrigger *> *extraTriggers = [self extraHotkeyTriggersFromCore];
+    NSLog(@"[Koe] Reloaded hotkey config: trigger=%d/%d flag=0x%llx kind=%d extra=%lu",
           newConfig.trigger_key_code,
           newConfig.trigger_alt_key_code,
           (unsigned long long)newConfig.trigger_modifier_flag,
-          newConfig.trigger_match_kind);
+          newConfig.trigger_match_kind,
+          (unsigned long)extraTriggers.count);
 
-    [self applyHotkeyConfig:newConfig restartMonitorIfNeeded:YES];
+    [self applyHotkeyConfig:newConfig extraTriggers:extraTriggers restartMonitorIfNeeded:YES];
     [self.overlayPanel reloadAppearanceFromConfig];
 }
 
@@ -329,7 +348,9 @@ static BOOL SPLabFlag(const char *name) {
 
             // Apply hotkey configuration from config.yaml
             struct SPHotkeyConfig hotkeyConfig = sp_core_get_hotkey_config();
-            [self applyHotkeyConfig:hotkeyConfig restartMonitorIfNeeded:NO];
+            [self applyHotkeyConfig:hotkeyConfig
+                      extraTriggers:[self extraHotkeyTriggersFromCore]
+             restartMonitorIfNeeded:NO];
 
             [self.hotkeyMonitor start];
             NSLog(@"[Koe] Ready — hotkey monitor active");

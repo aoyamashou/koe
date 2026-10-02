@@ -24,6 +24,24 @@ typedef NS_ENUM(uint8_t, SPHotkeyTriggerMode) {
     SPHotkeyTriggerModeDoubleTap = 2,
 };
 
+/// One trigger hotkey. Immutable value object; the monitor accepts several of
+/// them and any one can start/stop voice input.
+@interface SPHotkeyTrigger : NSObject
+@property (nonatomic, assign, readonly) NSInteger keyCode;
+/// Alternative key code for the same physical key (e.g. Globe = 179), 0 if none.
+@property (nonatomic, assign, readonly) NSInteger altKeyCode;
+/// Modifier-only: the key-state flag observed on flagsChanged.
+/// KeyDown: the exact modifier mask required alongside keyCode.
+@property (nonatomic, assign, readonly) NSUInteger modifierFlag;
+@property (nonatomic, assign, readonly) uint8_t matchKind;
+@property (nonatomic, assign, readonly, getter=isModifierOnly) BOOL modifierOnly;
+- (instancetype)initWithKeyCode:(NSInteger)keyCode
+                     altKeyCode:(NSInteger)altKeyCode
+                   modifierFlag:(NSUInteger)modifierFlag
+                      matchKind:(uint8_t)matchKind;
+- (BOOL)matchesKeyCode:(NSInteger)keyCode;
+@end
+
 @interface SPHotkeyMonitor : NSObject
 
 /// Threshold in milliseconds to distinguish tap from hold. Default 180ms.
@@ -42,6 +60,11 @@ typedef NS_ENUM(uint8_t, SPHotkeyTriggerMode) {
 
 /// How the trigger hotkey should be matched.
 @property (nonatomic, assign) uint8_t targetMatchKind;
+
+/// Additional trigger hotkeys that behave exactly like the primary one
+/// (targetKeyCode & co.) and share its triggerMode. Only one trigger is
+/// active at a time: while one is held, presses of the others are ignored.
+@property (nonatomic, copy) NSArray<SPHotkeyTrigger *> *extraTriggers;
 
 /// Maximum interval from the first press to the second press in double-tap
 /// mode. Defaults to the user's macOS double-click interval.

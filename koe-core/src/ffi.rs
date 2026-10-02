@@ -237,6 +237,18 @@ pub struct SPHotkeyConfig {
     pub trigger_mode: u8,
 }
 
+/// One extra trigger hotkey (see `hotkey.extra_trigger_keys`). Same field
+/// meaning as the matching fields of `SPHotkeyConfig`; the trigger mode is
+/// shared with the primary trigger.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SPHotkeyTriggerParams {
+    pub key_code: u16,
+    pub alt_key_code: u16,
+    pub modifier_flag: u64,
+    pub match_kind: u8,
+}
+
 /// Helper to convert a C string pointer to a Rust &str
 ///
 /// # Safety
