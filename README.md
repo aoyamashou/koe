@@ -399,7 +399,7 @@ hotkey:
 | `right_control` | Right Control | Only on full-size/external keyboards |
 
 Hotkey changes take effect automatically within a few seconds. `trigger_key`
-plus any `extra_trigger_keys` can each start voice input (for example Fn **or**
+plus up to 8 `extra_trigger_keys` can each start voice input (for example Fn **or**
 PageDown), and they all share the same `trigger_mode`. Only one trigger is
 active at a time: while one is held, presses of the others are ignored. A
 non-modifier extra key such as PageDown is swallowed while it is the trigger,

@@ -169,6 +169,8 @@ static BOOL SPLabFlag(const char *name) {
 }
 
 - (NSArray<SPHotkeyTrigger *> *)extraHotkeyTriggersFromCore {
+    // Keep in sync with MAX_EXTRA_TRIGGER_KEYS in koe-core (config.rs), which
+    // caps hotkey.extra_trigger_keys at this many entries.
     struct SPHotkeyTriggerParams raw[8];
     uint32_t count = sp_core_get_extra_hotkey_triggers(raw, 8);
     NSMutableArray<SPHotkeyTrigger *> *triggers = [NSMutableArray arrayWithCapacity:count];

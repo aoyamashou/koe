@@ -931,6 +931,10 @@ pub struct HotkeyParams {
     pub match_kind: HotkeyMatchKind,
 }
 
+/// Upper bound on `hotkey.extra_trigger_keys`. The native side reads them into
+/// a fixed buffer of this size (see `extraHotkeyTriggersFromCore`).
+pub const MAX_EXTRA_TRIGGER_KEYS: usize = 8;
+
 impl HotkeySection {
     /// Resolve the configured trigger hotkey into concrete key codes and
     /// modifier flags for the native side.
@@ -949,6 +953,12 @@ impl HotkeySection {
         let primary = self.resolve();
         let mut resolved: Vec<HotkeyParams> = Vec::new();
         for raw in &self.extra_trigger_keys {
+            if resolved.len() >= MAX_EXTRA_TRIGGER_KEYS {
+                log::warn!(
+                    "hotkey.extra_trigger_keys supports at most {MAX_EXTRA_TRIGGER_KEYS} keys; ignoring the rest"
+                );
+                break;
+            }
             let Some(key) = Self::try_normalize_trigger_key_name(raw.trim()) else {
                 log::warn!("ignoring unrecognised hotkey.extra_trigger_keys entry: {raw:?}");
                 continue;
@@ -2454,6 +2464,13 @@ mod tests {
         // duplicates the first.
         assert_eq!(extras.len(), 1);
         assert_eq!(extras[0].key_code, 63);
+    }
+
+    #[test]
+    fn extra_trigger_keys_are_capped() {
+        let h: HotkeySection =
+            serde_yaml::from_str("extra_trigger_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n").unwrap();
+        assert_eq!(h.resolve_extra().len(), MAX_EXTRA_TRIGGER_KEYS);
     }
 
     #[test]
