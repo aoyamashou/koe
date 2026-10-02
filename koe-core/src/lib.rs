@@ -15,7 +15,8 @@ use crate::ffi::{
     cstr_to_str, invoke_asr_final_text, invoke_final_text_ready, invoke_interim_text,
     invoke_rewrite_text_ready, invoke_session_error, invoke_session_ready,
     invoke_session_result_meta, invoke_session_warning, invoke_state_changed, SPCallbacks,
-    SPClipboardConfig, SPFeedbackConfig, SPHotkeyConfig, SPSessionContext, SPSessionMode,
+    SPClipboardConfig, SPFeedbackConfig, SPHotkeyConfig, SPHotkeyTriggerParams, SPSessionContext,
+    SPSessionMode,
 };
 #[cfg(feature = "mlx")]
 use crate::llm::mlx::MlxLlmProvider;
@@ -794,6 +795,39 @@ pub extern "C" fn sp_core_get_hotkey_config() -> SPHotkeyConfig {
             trigger_mode: 0,
         }
     }
+}
+
+/// Fill `out` (capacity `capacity` entries) with the extra trigger hotkeys from
+/// `hotkey.extra_trigger_keys`. Returns the number of entries written.
+///
+/// # Safety
+/// `out` must be null or point to at least `capacity` writable `SPHotkeyTriggerParams`s.
+#[no_mangle]
+pub unsafe extern "C" fn sp_core_get_extra_hotkey_triggers(
+    out: *mut SPHotkeyTriggerParams,
+    capacity: u32,
+) -> u32 {
+    if out.is_null() || capacity == 0 {
+        return 0;
+    }
+    let extras = {
+        let global = CORE.lock().unwrap();
+        match *global {
+            Some(ref core) => core.config.hotkey.resolve_extra(),
+            None => Vec::new(),
+        }
+    };
+    let mut written = 0_u32;
+    for params in extras.into_iter().take(capacity as usize) {
+        out.add(written as usize).write(SPHotkeyTriggerParams {
+            key_code: params.key_code,
+            alt_key_code: params.alt_key_code,
+            modifier_flag: params.modifier_flag,
+            match_kind: params.match_kind as u8,
+        });
+        written += 1;
+    }
+    written
 }
 
 // ─── Session Task ───────────────────────────────────────────────────

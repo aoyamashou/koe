@@ -52,6 +52,13 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 @property (nonatomic, strong) NSTimer *holdTimer;
 @property (nonatomic, strong) NSTimer *doubleTapTimer;
 @property (nonatomic, assign) BOOL triggerDown;
+// Primary trigger followed by extraTriggers. Rebuilt whenever any of them
+// changes; atomic because the tap thread reads it per key event.
+@property (atomic, copy) NSArray<SPHotkeyTrigger *> *allTriggers;
+// The trigger that is currently held (or was last held, until the next
+// press). Main thread only. Edges from other triggers are ignored while
+// triggerDown is YES so one trigger's release cannot end another's session.
+@property (nonatomic, strong) SPHotkeyTrigger *activeTrigger;
 @property (nonatomic, assign) CFMachPortRef eventTap;
 @property (nonatomic, assign) CFRunLoopSourceRef runLoopSource;
 @property (nonatomic, strong) id globalMonitorRef;
@@ -96,6 +103,14 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 - (void)handleFlagsChangedEvent:(CGEventRef)event;
 - (BOOL)handleNSEvent:(NSEvent *)event;
 - (BOOL)isTargetKeyCode:(NSInteger)keyCode;
+- (SPHotkeyTrigger *)triggerForKeyCode:(NSInteger)keyCode;
+- (SPHotkeyTrigger *)modifierOnlyTriggerForKeyCode:(NSInteger)keyCode;
+- (BOOL)allTriggersModifierOnly;
+- (BOOL)hasModifierOnlyTrigger;
+- (void)rebuildTriggers;
+- (BOOL)beginTrigger:(SPHotkeyTrigger *)trigger;
+- (BOOL)endTrigger:(SPHotkeyTrigger *)trigger;
+- (void)processModifierFlags:(NSUInteger)flags keyCode:(NSInteger)keyCode;
 - (BOOL)isModifierOnlyMatchKind:(uint8_t)matchKind;
 - (BOOL)keyModifiers:(NSUInteger)flags matchRequiredModifiers:(NSUInteger)requiredFlags;
 - (BOOL)isRecordingState;
@@ -136,6 +151,43 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
         if (monitor.tapContext != self) return nil;
     }
     return monitor;
+}
+
+@end
+
+@implementation SPHotkeyTrigger
+
+- (instancetype)initWithKeyCode:(NSInteger)keyCode
+                     altKeyCode:(NSInteger)altKeyCode
+                   modifierFlag:(NSUInteger)modifierFlag
+                      matchKind:(uint8_t)matchKind {
+    self = [super init];
+    if (self) {
+        _keyCode = keyCode;
+        _altKeyCode = altKeyCode;
+        _modifierFlag = modifierFlag;
+        _matchKind = matchKind;
+        _modifierOnly = (matchKind == SPHotkeyMatchKindModifierOnly);
+    }
+    return self;
+}
+
+- (BOOL)matchesKeyCode:(NSInteger)keyCode {
+    return keyCode == self.keyCode || (self.altKeyCode != 0 && keyCode == self.altKeyCode);
+}
+
+- (BOOL)isEqual:(id)object {
+    if (self == object) return YES;
+    if (![object isKindOfClass:[SPHotkeyTrigger class]]) return NO;
+    SPHotkeyTrigger *other = object;
+    return self.keyCode == other.keyCode &&
+           self.altKeyCode == other.altKeyCode &&
+           self.modifierFlag == other.modifierFlag &&
+           self.matchKind == other.matchKind;
+}
+
+- (NSUInteger)hash {
+    return (NSUInteger)self.keyCode ^ ((NSUInteger)self.altKeyCode << 16) ^ (self.modifierFlag << 1) ^ self.matchKind;
 }
 
 @end
@@ -248,7 +300,9 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         }
 
         if (isRepeat) {
-            return event;
+            // Auto-repeat of a held non-modifier trigger (e.g. PageDown) must
+            // not leak into the focused app: its first keyDown was swallowed.
+            return (suppressedTriggerKey && monitor.canConsumeGlobalKeyEvents) ? NULL : event;
         }
 
         // A Command tap that becomes a real keyboard shortcut (for example
@@ -291,13 +345,11 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
             });
         }
 
-        BOOL handlesModifierOnlyTrigger =
-            [monitor isModifierOnlyMatchKind:monitor.targetMatchKind] &&
-            [monitor isTargetKeyCode:keyCode];
+        SPHotkeyTrigger *trigger = [monitor triggerForKeyCode:keyCode];
+        BOOL handlesModifierOnlyTrigger = trigger && trigger.modifierOnly;
         BOOL handlesKeyDownMatchedTrigger =
-            ![monitor isModifierOnlyMatchKind:monitor.targetMatchKind] &&
-            [monitor isTargetKeyCode:keyCode] &&
-            ([monitor keyModifiers:flags matchRequiredModifiers:monitor.targetModifierFlag] ||
+            trigger && !trigger.modifierOnly &&
+            ([monitor keyModifiers:flags matchRequiredModifiers:trigger.modifierFlag] ||
              (type == kCGEventKeyUp && suppressedTriggerKey));
 
         if (handlesModifierOnlyTrigger || handlesKeyDownMatchedTrigger) {
@@ -310,12 +362,10 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
             // twice (start + immediate stop). All edges must be decided
             // against triggerDown serially on main.
             SPPerformOnMainRunLoop(^{
-                if (isDown == monitor.triggerDown) return;
-                monitor.triggerDown = isDown;
                 if (isDown) {
-                    [monitor handleTriggerDown];
+                    [monitor beginTrigger:trigger];
                 } else {
-                    [monitor handleTriggerUp];
+                    [monitor endTrigger:trigger];
                 }
             });
             if (handlesKeyDownMatchedTrigger && isDown) {
@@ -355,8 +405,103 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         _suppressedHotkeyKeyCodes = [NSMutableSet set];
         _numberKeyCaptureLimit = 9;
         _carbonHotKeyRefs = [NSMutableArray array];
+        _extraTriggers = @[];
+        [self rebuildTriggers];
     }
     return self;
+}
+
+#pragma mark - Trigger set
+
+// The primary/extra properties are plain settable values; every change
+// republishes the combined, immutable trigger list used for matching.
+- (void)setTargetKeyCode:(NSInteger)targetKeyCode {
+    _targetKeyCode = targetKeyCode;
+    [self rebuildTriggers];
+}
+
+- (void)setAltKeyCode:(NSInteger)altKeyCode {
+    _altKeyCode = altKeyCode;
+    [self rebuildTriggers];
+}
+
+- (void)setTargetModifierFlag:(NSUInteger)targetModifierFlag {
+    _targetModifierFlag = targetModifierFlag;
+    [self rebuildTriggers];
+}
+
+- (void)setTargetMatchKind:(uint8_t)targetMatchKind {
+    _targetMatchKind = targetMatchKind;
+    [self rebuildTriggers];
+}
+
+- (void)setExtraTriggers:(NSArray<SPHotkeyTrigger *> *)extraTriggers {
+    _extraTriggers = [extraTriggers copy] ?: @[];
+    [self rebuildTriggers];
+}
+
+- (void)rebuildTriggers {
+    SPHotkeyTrigger *primary = [[SPHotkeyTrigger alloc] initWithKeyCode:_targetKeyCode
+                                                             altKeyCode:_altKeyCode
+                                                           modifierFlag:_targetModifierFlag
+                                                              matchKind:_targetMatchKind];
+    self.allTriggers = [@[primary] arrayByAddingObjectsFromArray:_extraTriggers ?: @[]];
+}
+
+- (SPHotkeyTrigger *)triggerForKeyCode:(NSInteger)keyCode {
+    for (SPHotkeyTrigger *trigger in self.allTriggers) {
+        if ([trigger matchesKeyCode:keyCode]) return trigger;
+    }
+    return nil;
+}
+
+- (SPHotkeyTrigger *)modifierOnlyTriggerForKeyCode:(NSInteger)keyCode {
+    for (SPHotkeyTrigger *trigger in self.allTriggers) {
+        if (trigger.modifierOnly && [trigger matchesKeyCode:keyCode]) return trigger;
+    }
+    return nil;
+}
+
+- (BOOL)allTriggersModifierOnly {
+    for (SPHotkeyTrigger *trigger in self.allTriggers) {
+        if (!trigger.modifierOnly) return NO;
+    }
+    return YES;
+}
+
+- (BOOL)hasModifierOnlyTrigger {
+    for (SPHotkeyTrigger *trigger in self.allTriggers) {
+        if (trigger.modifierOnly) return YES;
+    }
+    return NO;
+}
+
+// Press edge for `trigger`. Main thread only. Returns NO if ignored because
+// another (or the same) trigger is already down.
+- (BOOL)beginTrigger:(SPHotkeyTrigger *)trigger {
+    if (self.triggerDown) return NO;
+    // A different trigger pressed while the previous one's modifier release is
+    // still being debounced: that release is genuine, so finish it first
+    // (re-pressing the SAME key within the window still cancels it as chatter).
+    if (self.pendingModifierReleaseBlock && self.activeTrigger && trigger &&
+        ![self.activeTrigger isEqual:trigger]) {
+        [self cancelPendingModifierRelease];
+        [self handleTriggerUp];
+    }
+    self.activeTrigger = trigger;
+    self.triggerDown = YES;
+    [self handleTriggerDown];
+    return YES;
+}
+
+// Release edge for `trigger` (non-debounced path). Main thread only. Returns
+// NO if `trigger` is not the one currently held.
+- (BOOL)endTrigger:(SPHotkeyTrigger *)trigger {
+    if (!self.triggerDown) return NO;
+    if (trigger && self.activeTrigger && ![self.activeTrigger isEqual:trigger]) return NO;
+    self.triggerDown = NO;
+    [self handleTriggerUp];
+    return YES;
 }
 
 - (void)start {
@@ -402,7 +547,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     // destroyed once at stop, never upgraded or cycled mid-run.
     // Non-modifier triggers consume their keyDown/keyUp so the trigger key
     // does not leak into the focused app.
-    return ![self isModifierOnlyMatchKind:self.targetMatchKind];
+    return ![self allTriggersModifierOnly];
 }
 
 - (void)startTapThread {
@@ -515,7 +660,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     }
     [self unregisterCarbonHotKeys];
     if (!self.running) return;
-    if (![self isModifierOnlyMatchKind:self.targetMatchKind]) return;
+    if (![self allTriggersModifierOnly]) return;
 
     BOOL wantsNumbers = (self.numberKeyHandler != nil);
     BOOL wantsEnter = (self.enterKeyHandler != nil);
@@ -570,7 +715,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 }
 
 - (BOOL)canConsumeHandlerKeyEvents {
-    if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
+    if ([self allTriggersModifierOnly]) {
         return self.carbonCaptureActive;
     }
     return self.canConsumeGlobalKeyEvents;
@@ -725,7 +870,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 }
 
 - (BOOL)isTargetKeyCode:(NSInteger)keyCode {
-    return keyCode == self.targetKeyCode || (self.altKeyCode != 0 && keyCode == self.altKeyCode);
+    return [self triggerForKeyCode:keyCode] != nil;
 }
 
 - (BOOL)isModifierOnlyMatchKind:(uint8_t)matchKind {
@@ -923,25 +1068,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         NSInteger keyCode = event.keyCode;
         NSLog(@"[Koe] NSEvent FlagsChanged: keyCode=%ld flags=0x%lx", (long)keyCode, (unsigned long)flags);
 
-        if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
-            if (![self isTargetKeyCode:keyCode]) {
-                if (self.triggerDown && (flags & self.targetModifierFlag) != 0) {
-                    [self cancelDoubleTapCandidateForInterveningInput];
-                }
-                return NO;
-            }
-            BOOL keyNow = (flags & self.targetModifierFlag) != 0;
-            if (keyNow != self.triggerDown) {
-                self.triggerDown = keyNow;
-                if (keyNow) {
-                    [self handleTriggerDown];
-                } else if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
-                    [self scheduleModifierRelease];
-                } else {
-                    [self handleTriggerUp];
-                }
-            }
-        }
+        [self processModifierFlags:flags keyCode:keyCode];
     } else if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
         NSInteger keyCode = event.keyCode;
         if (event.type == NSEventTypeKeyDown && ![self isTargetKeyCode:keyCode]) {
@@ -959,28 +1086,30 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 
         // Some macOS versions send modifier keys as keyDown/keyUp events. Keep
         // a direct keyDown/keyUp fallback for modifier-only triggers like Fn.
+        SPHotkeyTrigger *trigger = [self triggerForKeyCode:keyCode];
         BOOL shouldHandleTriggerKeyEvent = NO;
-        if ([self isTargetKeyCode:keyCode]) {
-            if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
+        if (trigger) {
+            if (trigger.modifierOnly) {
                 shouldHandleTriggerKeyEvent = YES;
-            } else if ([self keyModifiers:flags matchRequiredModifiers:self.targetModifierFlag]) {
+            } else if ([self keyModifiers:flags matchRequiredModifiers:trigger.modifierFlag]) {
                 shouldHandleTriggerKeyEvent = YES;
             }
         }
 
         if (shouldHandleTriggerKeyEvent) {
             BOOL isDown;
-            if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
-                isDown = (flags & self.targetModifierFlag) != 0;
+            if (trigger.modifierOnly) {
+                isDown = (flags & trigger.modifierFlag) != 0;
             } else {
                 isDown = (event.type == NSEventTypeKeyDown);
             }
             NSLog(@"[Koe] NSEvent Key%@: keyCode=%ld", isDown ? @"Down" : @"Up", (long)keyCode);
-            if (isDown != self.triggerDown) {
-                self.triggerDown = isDown;
-                if (isDown) {
-                    [self handleTriggerDown];
-                } else if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
+            if (isDown) {
+                [self beginTrigger:trigger];
+            } else if (self.triggerDown &&
+                       (!self.activeTrigger || [self.activeTrigger isEqual:trigger])) {
+                self.triggerDown = NO;
+                if (trigger.modifierOnly) {
                     [self scheduleModifierRelease];
                 } else {
                     [self handleTriggerUp];
@@ -1030,42 +1159,42 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     // Log every flags-changed event for debugging
     NSLog(@"[Koe] FlagsChanged: keyCode=%ld flags=0x%llx", (long)keyCode, (unsigned long long)flags);
 
-    // Target key detection:
-    // 1. Check if keyCode matches the configured trigger key
-    // 2. Check modifier flag bit for key state
-    BOOL triggerNow;
-    if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
-        triggerNow = (flags & self.targetModifierFlag) != 0;
-        BOOL isReleaseFallback = self.triggerDown && !triggerNow;
-        if (![self isTargetKeyCode:keyCode] && !isReleaseFallback) {
-            if (self.triggerDown && triggerNow) {
-                SPPerformOnMainRunLoop(^{
-                    [self cancelDoubleTapCandidateForInterveningInput];
-                });
-            }
-            return;
-        }
-    } else {
-        return;
-    }
+    if (![self hasModifierOnlyTrigger]) return;
 
     // Dedup and mutate triggerDown ON THE MAIN THREAD (see the keyDown path
     // in hotkeyEventCallback for why): the NSEvent monitor delivers the same
     // physical event on the main thread, and deciding edges against a
     // triggerDown that the tap thread already flipped lets a fast tap be
     // processed twice — starting a session and instantly ending it.
-    if (triggerNow) {
-        SPPerformOnMainRunLoop(^{
-            if (self.triggerDown) return;
-            self.triggerDown = YES;
-            [self handleTriggerDown];
-        });
-    } else {
-        SPPerformOnMainRunLoop(^{
-            if (!self.triggerDown) return;
+    NSUInteger flagBits = (NSUInteger)flags;
+    SPPerformOnMainRunLoop(^{
+        [self processModifierFlags:flagBits keyCode:keyCode];
+    });
+}
+
+// Shared flagsChanged handling for the tap and the NSEvent fallback. Main
+// thread only.
+- (void)processModifierFlags:(NSUInteger)flags keyCode:(NSInteger)keyCode {
+    SPHotkeyTrigger *keyTrigger = [self modifierOnlyTriggerForKeyCode:keyCode];
+
+    if (self.triggerDown && self.activeTrigger && self.activeTrigger.modifierOnly) {
+        SPHotkeyTrigger *active = self.activeTrigger;
+        BOOL activeNow = (flags & active.modifierFlag) != 0;
+        if (!activeNow) {
+            // The held trigger's flag cleared. Treat it as the release even
+            // when the event names another key (release fallback).
             self.triggerDown = NO;
             [self scheduleModifierRelease];
-        });
+        } else if (![active isEqual:keyTrigger]) {
+            // Some other key's modifier change while the trigger is held.
+            [self cancelDoubleTapCandidateForInterveningInput];
+        }
+        return;
+    }
+
+    if (!keyTrigger) return;
+    if ((flags & keyTrigger.modifierFlag) != 0) {
+        [self beginTrigger:keyTrigger];
     }
 }
 
@@ -1096,13 +1225,15 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     // fire while a modal loop runs (Sparkle update prompt, NSAlert) — the
     // release would freeze there while trigger-down events keep arriving,
     // wedging the state machine.
+    SPHotkeyTrigger *releasedTrigger = self.activeTrigger;
+    NSUInteger releasedModifierFlag = releasedTrigger ? releasedTrigger.modifierFlag : self.targetModifierFlag;
     __block dispatch_block_t scheduled = nil;
     scheduled = dispatch_block_create(0, ^{
         SPPerformOnMainRunLoop(^{
             // Superseded or cancelled while we hopped threads.
             if (self.pendingModifierReleaseBlock != scheduled) return;
             self.pendingModifierReleaseBlock = nil;
-            if (([self currentModifierFlags] & self.targetModifierFlag) != 0) {
+            if (([self currentModifierFlags] & releasedModifierFlag) != 0) {
                 self.triggerDown = YES;
                 return;
             }

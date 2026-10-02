@@ -94,6 +94,8 @@ static BOOL sessionStateAllowsConfigReloadForTest(NSString *state) {
 - (void)setRunning:(BOOL)running;
 - (void)setTriggerDown:(BOOL)triggerDown;
 - (NSUInteger)currentModifierFlags;
+- (BOOL)beginTrigger:(SPHotkeyTrigger *)trigger;
+- (BOOL)endTrigger:(SPHotkeyTrigger *)trigger;
 @end
 
 static NSUInteger SPStubbedCurrentModifierFlags = 0;
@@ -157,6 +159,31 @@ static void SPInstallCurrentModifierFlagsStub(void) {
 
     XCTAssertEqual(delegate.triggerCancelCount, 1);
     XCTAssertEqual(delegate.holdStartCount, 0);
+}
+
+- (void)testExtraTriggerStartsAndOtherTriggerReleaseIsIgnored {
+    SPHotkeyMonitorTestDelegate *delegate = [SPHotkeyMonitorTestDelegate new];
+    SPHotkeyMonitor *monitor = [[SPHotkeyMonitor alloc] initWithDelegate:delegate];
+    [monitor setRunning:YES];
+    monitor.triggerMode = SPHotkeyTriggerModeHold;
+    SPHotkeyTrigger *pageDown = [[SPHotkeyTrigger alloc] initWithKeyCode:121
+                                                              altKeyCode:0
+                                                            modifierFlag:0
+                                                               matchKind:SPHotkeyMatchKindKeyDown];
+    monitor.extraTriggers = @[pageDown];
+
+    XCTAssertTrue([monitor beginTrigger:pageDown]);
+    [monitor holdTimerFired];
+    XCTAssertEqual(delegate.holdStartCount, 1);
+
+    // The primary (Fn) trigger neither starts a second session nor ends this one.
+    SPHotkeyTrigger *fn = [[monitor valueForKey:@"allTriggers"] firstObject];
+    XCTAssertFalse([monitor beginTrigger:fn]);
+    XCTAssertFalse([monitor endTrigger:fn]);
+    XCTAssertEqual(delegate.holdEndCount, 0);
+
+    XCTAssertTrue([monitor endTrigger:pageDown]);
+    XCTAssertEqual(delegate.holdEndCount, 1);
 }
 
 - (void)testDefersReloadDuringActiveSession {

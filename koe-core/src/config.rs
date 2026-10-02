@@ -855,6 +855,31 @@ where
     deserializer.deserialize_any(StringOrInt)
 }
 
+/// Deserialize a YAML list whose items can be strings ("pagedown") or integers
+/// (121) into a `Vec<String>`. A missing or `null` value yields an empty list.
+fn deserialize_string_or_int_list<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Item {
+        Str(String),
+        Int(i64),
+    }
+    let items: Option<Vec<Item>> = Option::deserialize(deserializer)?;
+    Ok(items
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| match item {
+            Item::Str(s) => s,
+            Item::Int(n) => n.to_string(),
+        })
+        .collect())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct HotkeySection {
     /// Trigger key for voice input.
@@ -866,6 +891,13 @@ pub struct HotkeySection {
         deserialize_with = "deserialize_string_or_int"
     )]
     pub trigger_key: String,
+
+    /// Additional trigger keys that start/stop voice input exactly like
+    /// `trigger_key` (same `trigger_mode`). Accepts the same values, e.g.
+    /// `["pagedown"]` or `[121, "right_option"]`. Unrecognised entries are
+    /// ignored with a warning.
+    #[serde(default, deserialize_with = "deserialize_string_or_int_list")]
+    pub extra_trigger_keys: Vec<String>,
 
     /// Legacy field kept only so older configs still deserialize cleanly.
     /// Runtime no longer exposes or resolves a separate cancel hotkey.
@@ -885,7 +917,7 @@ pub enum HotkeyMatchKind {
 }
 
 /// Resolved hotkey parameters for the native side
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyParams {
     /// Primary key code (from Carbon Events)
     pub key_code: u16,
@@ -899,6 +931,10 @@ pub struct HotkeyParams {
     pub match_kind: HotkeyMatchKind,
 }
 
+/// Upper bound on `hotkey.extra_trigger_keys`. The native side reads them into
+/// a fixed buffer of this size (see `extraHotkeyTriggersFromCore`).
+pub const MAX_EXTRA_TRIGGER_KEYS: usize = 8;
+
 impl HotkeySection {
     /// Resolve the configured trigger hotkey into concrete key codes and
     /// modifier flags for the native side.
@@ -910,24 +946,61 @@ impl HotkeySection {
         Self::normalize_trigger_key_name(&self.trigger_key)
     }
 
+    /// Resolve `extra_trigger_keys` into native hotkey parameters. Entries that
+    /// cannot be parsed, or that duplicate the primary trigger or an earlier
+    /// extra, are skipped.
+    pub fn resolve_extra(&self) -> Vec<HotkeyParams> {
+        let primary = self.resolve();
+        let mut resolved: Vec<HotkeyParams> = Vec::new();
+        for raw in &self.extra_trigger_keys {
+            if resolved.len() >= MAX_EXTRA_TRIGGER_KEYS {
+                log::warn!(
+                    "hotkey.extra_trigger_keys supports at most {MAX_EXTRA_TRIGGER_KEYS} keys; ignoring the rest"
+                );
+                break;
+            }
+            let Some(key) = Self::try_normalize_trigger_key_name(raw.trim()) else {
+                log::warn!("ignoring unrecognised hotkey.extra_trigger_keys entry: {raw:?}");
+                continue;
+            };
+            let params = Self::resolve_key(&key);
+            if params == primary || resolved.contains(&params) {
+                continue;
+            }
+            resolved.push(params);
+        }
+        resolved
+    }
+
     fn normalize_trigger_key_name(value: &str) -> String {
+        Self::try_normalize_trigger_key_name(value).unwrap_or_else(default_trigger_key)
+    }
+
+    fn try_normalize_trigger_key_name(value: &str) -> Option<String> {
         match value {
             "left_option" | "right_option" | "left_command" | "right_command" | "left_control"
-            | "right_control" | "fn" => value.into(),
+            | "right_control" | "fn" => Some(value.into()),
             _ if Self::parse_raw_keycode(value).is_some() => {
-                Self::parse_raw_keycode(value).unwrap().to_string()
+                Some(Self::parse_raw_keycode(value).unwrap().to_string())
             }
-            _ if Self::parse_hotkey_combo(value).is_some() => {
-                Self::parse_hotkey_combo(value).unwrap().normalized_value
-            }
-            _ => default_trigger_key(),
+            _ => Self::parse_hotkey_combo(value).map(|combo| combo.normalized_value),
         }
     }
 
     /// Try to parse a string as a raw keycode (u16).
     /// Supports decimal (e.g. "122") and hex with 0x prefix (e.g. "0x7a").
+    /// Also accepts a few names for common non-modifier navigation keys
+    /// (e.g. "pagedown").
     fn parse_raw_keycode(value: &str) -> Option<u16> {
         let trimmed = value.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "page_up" | "pageup" => return Some(116),
+            "page_down" | "pagedown" => return Some(121),
+            "home" => return Some(115),
+            "end" => return Some(119),
+            "forward_delete" | "forwarddelete" => return Some(117),
+            _ => {}
+        }
         if let Some(hex) = trimmed
             .strip_prefix("0x")
             .or_else(|| trimmed.strip_prefix("0X"))
@@ -2206,6 +2279,9 @@ hotkey:
   # 触发键：fn | left_option | right_option | left_command | right_command | left_control | right_control
   # 也可以填 macOS keycode 数字来使用非修饰键，例如 122 (F1)、120 (F2)、99 (F3) 等
   trigger_key: "fn"
+  # 额外的触发键（可选）：与 trigger_key 同样的取值，也可用 pageup / pagedown / home / end 等名称
+  # 例如同时用 Fn 和 PageDown 触发：extra_trigger_keys: ["pagedown"]
+  extra_trigger_keys: []
   trigger_mode: "hold"                 # hold | toggle | double_tap
 
 overlay:
@@ -2294,6 +2370,7 @@ mod tests {
     fn normalized_keys_invalid_trigger_falls_back_to_fn() {
         let h = HotkeySection {
             trigger_key: "nonexistent".into(),
+            extra_trigger_keys: vec![],
             cancel_key: "left_option".into(),
             trigger_mode: "hold".into(),
         };
@@ -2308,6 +2385,7 @@ mod tests {
         let config = Config {
             hotkey: HotkeySection {
                 trigger_key: "0x7A".into(),
+                extra_trigger_keys: vec![],
                 cancel_key: "".into(),
                 trigger_mode: "hold".into(),
             },
@@ -2334,6 +2412,7 @@ mod tests {
     fn normalized_keys_canonicalize_combo() {
         let h = HotkeySection {
             trigger_key: "shift+cmd+49".into(),
+            extra_trigger_keys: vec![],
             cancel_key: "command+shift+49".into(),
             trigger_mode: "hold".into(),
         };
@@ -2344,6 +2423,7 @@ mod tests {
     fn resolve_combo_hotkey_uses_keydown_match_kind() {
         let h = HotkeySection {
             trigger_key: "cmd+shift+49".into(),
+            extra_trigger_keys: vec![],
             cancel_key: "option+53".into(),
             trigger_mode: "hold".into(),
         };
@@ -2353,6 +2433,51 @@ mod tests {
         assert_eq!(resolved.alt_key_code, 0);
         assert_eq!(resolved.modifier_flag, 0x0010_0000 | 0x0002_0000);
         assert_eq!(resolved.match_kind, HotkeyMatchKind::KeyDown);
+    }
+
+    #[test]
+    fn extra_trigger_keys_accept_names_and_numbers() {
+        let h: HotkeySection = serde_yaml::from_str(
+            "trigger_key: fn\nextra_trigger_keys: [pagedown, 116, right_option]\n",
+        )
+        .unwrap();
+        let extras = h.resolve_extra();
+
+        assert_eq!(extras.len(), 3);
+        assert_eq!(extras[0].key_code, 121);
+        assert_eq!(extras[0].match_kind, HotkeyMatchKind::KeyDown);
+        assert_eq!(extras[0].modifier_flag, 0);
+        assert_eq!(extras[1].key_code, 116);
+        assert_eq!(extras[2].key_code, 61);
+        assert_eq!(extras[2].match_kind, HotkeyMatchKind::ModifierOnly);
+    }
+
+    #[test]
+    fn extra_trigger_keys_skip_invalid_and_duplicate_entries() {
+        let h: HotkeySection = serde_yaml::from_str(
+            "trigger_key: pagedown\nextra_trigger_keys: [nonsense, 121, fn, fn]\n",
+        )
+        .unwrap();
+        let extras = h.resolve_extra();
+
+        // "nonsense" is dropped, 121 duplicates the primary, the second fn
+        // duplicates the first.
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].key_code, 63);
+    }
+
+    #[test]
+    fn extra_trigger_keys_are_capped() {
+        let h: HotkeySection =
+            serde_yaml::from_str("extra_trigger_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n").unwrap();
+        assert_eq!(h.resolve_extra().len(), MAX_EXTRA_TRIGGER_KEYS);
+    }
+
+    #[test]
+    fn extra_trigger_keys_default_to_empty() {
+        let h = HotkeySection::default();
+        assert!(h.extra_trigger_keys.is_empty());
+        assert!(h.resolve_extra().is_empty());
     }
 
     #[test]

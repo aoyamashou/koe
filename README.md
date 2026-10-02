@@ -382,6 +382,9 @@ hotkey:
   # You can also use a raw macOS keycode number such as 96 (F5) or 122 (F1),
   # or a normalized key combo such as "command+shift+49".
   trigger_key: "fn"
+  # Optional: more keys that trigger voice input exactly like trigger_key.
+  # Same values as above, plus names like pageup / pagedown / home / end.
+  extra_trigger_keys: ["pagedown"]
   trigger_mode: "hold"  # "hold" | "toggle" | "double_tap"
 ```
 
@@ -395,8 +398,12 @@ hotkey:
 | `left_control` | Left Control | Available on all Mac keyboards |
 | `right_control` | Right Control | Only on full-size/external keyboards |
 
-Hotkey changes take effect automatically within a few seconds. Koe now uses a
-single trigger shortcut model:
+Hotkey changes take effect automatically within a few seconds. `trigger_key`
+plus up to 8 `extra_trigger_keys` can each start voice input (for example Fn **or**
+PageDown), and they all share the same `trigger_mode`. Only one trigger is
+active at a time: while one is held, presses of the others are ignored. A
+non-modifier extra key such as PageDown is swallowed while it is the trigger,
+so it will no longer scroll the page. Modes:
 
 - `hold`: press-and-hold to record, release to stop
 - `toggle`: tap once to start, tap again to stop
